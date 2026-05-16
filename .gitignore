@@ -1,0 +1,31 @@
+# Build outputs
+/build/
+/build-*/
+/cmake-build-*/
+
+# Extracted Apple libs (never committed)
+/rootfs/system/lib64/*.so
+/rootfs/system/bin/main
+/rootfs/system/bin/linker64
+/rootfs/system/bin/linker
+/rootfs/dev/
+
+# Final binaries at repo root (produced by build)
+/wrapper
+/main
+
+# Tooling caches and APK staging
+/.tmp/
+/.cache/
+*.apk
+*.apkm
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
