@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build:
     name: build (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     # Fork PRs cannot use repository secrets (APK_URL).
     if: |
       github.event_name != 'pull_request' ||
@@ -25,7 +25,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            docker_platform: linux/amd64
+          - arch: arm64-v8a
+            runner: ubuntu-24.04-arm
+            docker_platform: linux/arm64
 
     env:
       APK_URL: ${{ secrets.APK_URL }}
@@ -52,18 +58,15 @@ jobs:
 
       - name: Download and verify .apkm
         run: |
-          mkdir -p .tmp
           ./tools/fetch-apk.sh \
             --url "${APK_URL}" \
-            --expect apkm \
-            --out .tmp/bundle.apkm
+            --expect apkm
 
       - name: Extract Apple native libs
         run: |
           ./tools/extract-libs.sh \
             --bundle .tmp/bundle.apkm \
-            --arch ${{ matrix.arch }} \
-            --out rootfs/system/lib64
+            --arch ${{ matrix.arch }}
 
       - name: Stage Android system binaries
         run: |
@@ -72,6 +75,8 @@ jobs:
       - name: Build Docker image
         run: |
           docker build \
+            --build-arg BUILD_PLATFORM=${{ matrix.docker_platform }} \
+            --build-arg RUNTIME_PLATFORM=${{ matrix.docker_platform }} \
             --build-arg TARGET_ARCH=${{ matrix.arch }} \
             -t wrapper-v2:${{ github.sha }} \
             .

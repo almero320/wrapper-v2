@@ -1,10 +1,9 @@
 # wrapper-v2
 
 A clean rewrite of the Apple Music FairPlay decryption wrapper. Currently in
-**Phase 1.3** — same as 1.1, plus **`GET /playback`** which returns the
-**entire** MZ playback dispatch as native JSON (Phase 1.2, replaces the
-single-URL `/m3u8` helper upstream exposes), and **`POST /decrypt`** for
-FairPlay sample decryption over JSON (batch base64 in/out).
+**Phase 1.3** — same as 1.1, plus **`GET /playback`** (Phase 1.2) and **`POST /decrypt`**.
+**Phase 3** is done for **`arm64-v8a`** images (NDK + CI matrix on `ubuntu-24.04-arm`;
+see **Building** → arm64-v8a).
 
 ## What it is
 
@@ -28,7 +27,7 @@ the build fails loudly.
 | 1.2   | `GET /playback` (full MZ playback dispatch as native JSON)                                                | **Done** |
 | 1.3   | `POST /decrypt` (FairPlay FPS sample decrypt, JSON base64 batch)                                          | **Done** |
 | 2     | Rate limit, dedupe, request queue                                                                         | Pending  |
-| 3     | arm64-v8a build, multi-arch Docker                                                                        | Pending  |
+| 3     | arm64-v8a build, multi-arch Docker                                                                        | **Done** |
 
 ## HTTP API
 
@@ -84,7 +83,10 @@ Optional `WRAPPER_APPLE_ID` only sets the `apple_id` label in `/me` after restor
 │   └── stage-system.sh       copy committed Android binaries into rootfs/
 └── vendor/
     └── android-system/       linker64 + bionic + AOSP libs, SHA-pinned
-        └── x86_64/
+        ├── x86_64/
+        │   ├── bin/linker64
+        │   └── lib64/*.so
+        └── arm64-v8a/
             ├── bin/linker64
             └── lib64/*.so
 ```
@@ -105,15 +107,13 @@ automatically by the Dockerfile.
 
 ```bash
 # 1. Fetch the APKMirror bundle (you provide the URL).
+#    Writes to .tmp/bundle.apkm by default (--out optional).
 APK_URL=https://your-mirror.example/apple-music-3.6.0-beta-1109.apkm \
-    tools/fetch-apk.sh --expect apkm \
-                        --out    .tmp/bundle.apkm
+    tools/fetch-apk.sh --expect apkm
 
-# 2. Extract Apple libs into rootfs/. The .apkm must match LIBS_VERSION.json
-#    .apkm; each extracted .so matches .libs.x86_64.
-tools/extract-libs.sh --bundle .tmp/bundle.apkm \
-                       --arch   x86_64 \
-                       --out    rootfs/system/lib64
+# 2. Extract Apple libs. Default --out is rootfs/system/lib64.
+#    The .apkm must match LIBS_VERSION.json; each .so matches .libs.<arch>.
+tools/extract-libs.sh --bundle .tmp/bundle.apkm --arch x86_64
 
 # 3. Stage the committed Android system binaries (linker64 + bionic + AOSP)
 #    into rootfs/, verifying their SHA-256 against LIBS_VERSION.json.
@@ -137,6 +137,22 @@ curl -X DELETE http://127.0.0.1/login
 The daemon binds port 80 inside the container and the compose file maps it
 to host port 80 by default. Override with `HTTP_PORT=8080 docker compose up`
 on machines that already have something on `:80`.
+
+### arm64-v8a image (Apple Silicon / AArch64 Linux)
+
+Use the same `.apkm`, but extract and stage **arm64-v8a**, then build with a **linux/arm64**
+base so the host `wrapper` and NDK output match the staged `linker64` / `.so` ABI:
+
+```bash
+tools/extract-libs.sh --bundle .tmp/bundle.apkm --arch arm64-v8a
+tools/stage-system.sh --arch arm64-v8a
+
+TARGET_ARCH=arm64-v8a \
+BUILD_PLATFORM=linux/arm64 RUNTIME_PLATFORM=linux/arm64 \
+  docker compose up --build
+```
+
+Cross-building `linux/arm64` from an x86_64 host (`docker buildx` + QEMU) is possible but slow; prefer a native arm64 builder when you can.
 
 ### Daemon configuration
 
@@ -164,6 +180,10 @@ It uses the same host steps as above plus a Docker build and `/health` smoke tes
 with one repository secret:
 
 - `APK_URL` - URL of the pinned `.apkm` (must match `LIBS_VERSION.json` → `apkm`)
+
+**Matrix:** `x86_64` on `ubuntu-latest` (amd64 image) and `arm64-v8a` on `ubuntu-24.04-arm`
+(arm64 image), with matching `BUILD_PLATFORM` / `RUNTIME_PLATFORM` so the launcher and
+daemon match the staged rootfs.
 
 Pull requests opened from forks skip the build job (they cannot read the
 secret).

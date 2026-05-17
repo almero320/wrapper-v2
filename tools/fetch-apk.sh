@@ -4,8 +4,10 @@
 #
 # Usage:
 #   APK_URL=https://example.com/bundle.apkm \
-#     tools/fetch-apk.sh --expect apkm --out .tmp/bundle.apkm
+#     tools/fetch-apk.sh --expect apkm [--out <path>]
 #
+# Defaults: --out <repo>/.tmp/bundle.apkm when --out is omitted.
+
 # The --expect value must be a top-level string key in LIBS_VERSION.json (e.g. apkm).
 set -euo pipefail
 
@@ -22,7 +24,7 @@ while [[ $# -gt 0 ]]; do
         --expect) EXPECT="$2"; shift 2 ;;
         --out)    OUT="$2";    shift 2 ;;
         -h|--help)
-            sed -n '2,15p' "$0"
+            sed -n '2,11p' "$0"
             exit 0
             ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -31,7 +33,9 @@ done
 
 if [[ -z "$URL" ]];    then echo "fetch-apk: missing --url or APK_URL"   >&2; exit 2; fi
 if [[ -z "$EXPECT" ]]; then echo "fetch-apk: missing --expect <libs_version_key>" >&2; exit 2; fi
-if [[ -z "$OUT" ]];    then echo "fetch-apk: missing --out <path>"      >&2; exit 2; fi
+if [[ -z "$OUT" ]]; then
+    OUT="$REPO_ROOT/.tmp/bundle.apkm"
+fi
 
 if ! command -v jq        >/dev/null; then echo "fetch-apk: jq is required"        >&2; exit 3; fi
 if ! command -v sha256sum >/dev/null; then echo "fetch-apk: sha256sum is required" >&2; exit 3; fi

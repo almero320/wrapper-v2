@@ -1,15 +1,15 @@
 # wrapper-v2 image.
 #
 # This Dockerfile assumes that rootfs/system/lib64/ has already been populated
-# by tools/extract-libs.sh on the host (or in CI). The image itself does not
-# fetch the APK - that is the caller's responsibility, so the build remains
-# hermetic and reproducible given identical inputs.
+# by tools/extract-libs.sh + tools/stage-system.sh on the host (or in CI) for
+# the same TARGET_ARCH. The image does not fetch the APK.
 #
-#   tools/fetch-apk.sh ...
-#   tools/extract-libs.sh ...
-#   docker build -t wrapper-v2 .
+# Native arch match (recommended):
+#   TARGET_ARCH=x86_64    -> BUILD_PLATFORM/RUNTIME_PLATFORM=linux/amd64
+#   TARGET_ARCH=arm64-v8a -> BUILD_PLATFORM/RUNTIME_PLATFORM=linux/arm64
 #
-# In CI the workflow under .github/workflows/build.yml does this.
+# Building an arm64 image on an x86 host requires buildx + QEMU and is slow;
+# prefer linux/arm64 builders (e.g. GitHub ubuntu-24.04-arm).
 
 ARG BUILD_PLATFORM=linux/amd64
 ARG RUNTIME_PLATFORM=linux/amd64
@@ -38,8 +38,14 @@ RUN --mount=type=cache,target=/var/lib/apt,sharing=locked \
         ninja-build \
         unzip
 
-RUN curl -fSL -o /tmp/ndk.zip \
-        "https://dl.google.com/android/repository/android-ndk-r${NDK_VERSION}b-linux.zip" && \
+RUN arch="$(uname -m)" && \
+    if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then \
+      ndk_zip="android-ndk-r${NDK_VERSION}b-linux-aarch64.zip"; \
+    else \
+      ndk_zip="android-ndk-r${NDK_VERSION}b-linux.zip"; \
+    fi && \
+    curl -fSL -o /tmp/ndk.zip \
+        "https://dl.google.com/android/repository/${ndk_zip}" && \
     unzip -q /tmp/ndk.zip -d /opt && \
     rm /tmp/ndk.zip
 ENV ANDROID_NDK_HOME=/opt/android-ndk-r${NDK_VERSION}b

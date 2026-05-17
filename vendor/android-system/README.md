@@ -31,12 +31,20 @@ These binaries are Apache-2.0 (AOSP). Redistribution is permitted; see
 
 ## Provenance
 
-The current x86_64 binaries were taken verbatim from
+The **x86_64** binaries were taken verbatim from
 [`zhaarey/wrapper`](https://github.com/zhaarey/wrapper) `rootfs/system/`,
 which sourced them from an Android x86_64 system image (likely API 21-29
-era based on file sizes and exported symbols). Their SHA-256 digests are
-pinned in [`LIBS_VERSION.json`](../../LIBS_VERSION.json) under
-`.android_system.<arch>` and verified at every build step.
+era based on file sizes and exported symbols).
+
+The **arm64-v8a** set was taken verbatim from
+[`WorldObservationLog/wrapper`](https://github.com/WorldObservationLog/wrapper)
+branch **`arm64`** `rootfs/system/` (same layout as x86: `bin/linker64`,
+`lib64/*.so`, etc.). The IANA timezone blob `usr/share/zoneinfo/tzdata` is
+the same file as x86\_64 (not present as a single file in that fork’s tree).
+
+SHA-256 digests for both arches are pinned in
+[`LIBS_VERSION.json`](../../LIBS_VERSION.json) under `.android_system.<arch>`
+and verified by `tools/stage-system.sh`.
 
 **Future work:** when reproducible provenance becomes important, replace
 these blobs with a `tools/fetch-android-system.sh` step that pulls a
@@ -48,6 +56,6 @@ change.
 
 ## Adding a new arch
 
-When `arm64-v8a` lands in Phase 4, add `vendor/android-system/arm64-v8a/`
-with the same eight files extracted from an arm64 Android image, plus a
-matching `.android_system.arm64-v8a` entry in `LIBS_VERSION.json`.
+For any new ABI, add `vendor/android-system/<arch>/` with the same relative
+paths as the existing arches, plus a matching `.android_system.<arch>` entry
+in `LIBS_VERSION.json`.

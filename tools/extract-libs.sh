@@ -6,11 +6,11 @@
 # not pinned; extracted .so files are still verified against .libs.<arch>.
 #
 # Usage:
-#   extract-libs.sh --bundle <path-to-.apkm> --arch <x86_64|arm64-v8a> --out <dir>
+#   extract-libs.sh --bundle <path-to-.apkm> [--arch <x86_64|arm64-v8a>] [--out <dir>]
 #
 # Options:
 #   --arch <x86_64|arm64-v8a>    Which arch's libs to extract (default x86_64)
-#   --out  <directory>           Where to drop the .so files
+#   --out  <directory>           Where to drop the .so files (default: <repo>/rootfs/system/lib64)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
         --arch)   ARCH="$2";   shift 2 ;;
         --out)    OUT="$2";    shift 2 ;;
         -h|--help)
-            sed -n '2,15p' "$0"
+            sed -n '2,13p' "$0"
             exit 0
             ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -38,8 +38,7 @@ if [[ -z "$BUNDLE" ]]; then
     exit 2
 fi
 if [[ -z "$OUT" ]]; then
-    echo "extract-libs: missing --out" >&2
-    exit 2
+    OUT="$REPO_ROOT/rootfs/system/lib64"
 fi
 
 case "$ARCH" in

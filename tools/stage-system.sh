@@ -7,7 +7,7 @@
 # Usage:
 #   tools/stage-system.sh [--arch <x86_64|arm64-v8a>] [--rootfs <path>]
 #
-# Defaults: --arch x86_64, --rootfs ./rootfs
+# Defaults: --arch x86_64, --rootfs <repo>/rootfs
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
