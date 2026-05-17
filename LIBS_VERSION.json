@@ -148,6 +148,7 @@
       "lib64/libnetd_client.so": "e68eadae0dd59e9cdc9cf8077ae458816788afacea68919ce6e51e830a98cd29",
       "lib64/libnetutils.so": "5ef491e362dde12c779e9342e863263249b226c7b385733f5f9faf19f8cf374a",
       "lib64/libopus.so": "d05d2ee653d00ffe53338d841b2b9fed2e979e40d5b3bbc2b438d0603ab3c096",
+      "lib64/libpcre.so": "46229f7fd0dff4814aaecc8df2030d36ce1ac517880433b25054fb2285fd26bf",
       "lib64/libpdfium.so": "4cbb3799ebf90884fd8083f662c96d6f21483c9a3c8bb8ab49005012fbe99b64",
       "lib64/libpng.so": "309934f1ec93c028db323e4567d9fb80fdb9fa3fd56fe0fd0109ffabd289d6c7",
       "lib64/libpowermanager.so": "1c03f0a4f693a762c4e18421d2a1f8940daeec47cdcd2d86a10eb6bae6301cd7",
