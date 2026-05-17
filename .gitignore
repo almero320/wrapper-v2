@@ -19,6 +19,7 @@
 
 # Tooling caches and APK staging
 /.tmp/
+/.temp/.login-response.json
 /.cache/
 *.apk
 *.apkm

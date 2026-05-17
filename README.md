@@ -1,9 +1,10 @@
 # wrapper-v2
 
 A clean rewrite of the Apple Music FairPlay decryption wrapper. Currently in
-**Phase 1** - the daemon initializes Apple's native libraries at startup and
-exposes a small HTTP API for managing the stored Media User Token. M3U8 and
-decrypt endpoints are coming in subsequent Phase 1 commits.
+**Phase 1.1** - the daemon initializes Apple's native libraries at startup,
+runs **Apple ID + password** sign-in via `AuthenticateFlow` (same family of
+calls as upstream `main.c`), and exposes harvested tokens over HTTP. M3U8 and
+decrypt endpoints are coming in later Phase 1 slices.
 
 ## What it is
 
@@ -22,11 +23,11 @@ the build fails loudly.
 | Phase | Goal | State |
 | --- | --- | --- |
 | 0 | Repo skeleton, build chain, NDK toolchain, CI smoke test | **Done** |
-| 1.0 | Apple lib runtime init at startup, `/login` + `/me` endpoints | **In progress** |
-| 1.1 | `/storefront`, `/dev-token` endpoints (Media User Token unused) | Pending |
+| 1.0 | Apple lib runtime init, dlopen loader, vendored AOSP closure | **Done** |
+| 1.1 | `POST /login`, `POST /login/2fa`, token harvest, `/me`, startup session restore (warm `WRAPPER_BASE_DIR`) | **Done** |
 | 1.2 | `/m3u8` (asset URL fetch) | Pending |
 | 1.3 | `/decrypt` (full MP4 round-trip, batch sample decrypt) | Pending |
-| 2 | Caching, rate limit, dedupe, request queue | Pending |
+| 2 | Rate limit, dedupe, request queue | Pending |
 | 3 | arm64-v8a build, multi-arch Docker | Pending |
 
 ## HTTP API
@@ -35,16 +36,20 @@ Every endpoint accepts and returns `application/json`.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness probe. Returns `{status, phase, version}`. |
-| `GET` | `/me` | Snapshot of `{runtime, auth, version}`. Reports whether the Apple runtime initialized cleanly and whether a Media User Token is currently cached. |
-| `POST` | `/login` | Body: `{"media_user_token": "..."}`. Caches the token in process memory. Returns the token preview and the timestamp it was set. |
-| `DELETE` | `/login` | Drops the cached Media User Token. Idempotent. |
+| `GET` | `/health` | Liveness probe. `{status, phase, version, runtime}`. |
+| `GET` | `/me` | `{version, runtime, auth}` — runtime flags plus login state; when **authenticated** (after login or startup session restore from disk), `auth` includes `dev_token`, `music_user_token`, `storefront`, `dsid`, and timestamps. iTunes account token / `X-Token` are not returned. |
+| `POST` | `/login` | Body: `{"username": "...", "password": "..."}` or `{"apple_id": "...", "password": "..."}` (synonyms). Drives Apple's `AuthenticateFlow`. Returns `200` + token snapshot, `202` if **2FA** is required (then `POST /login/2fa`), or `401` on failure. |
+| `POST` | `/login/2fa` | Body: `{"code": "123456"}`. Continues a login waiting for HSA2. |
+| `DELETE` | `/login` | Aborts an in-flight login or clears cached tokens from memory. Apple's on-disk `mpl_db` cache is unchanged. |
 
-The Media User Token is the credential Apple's modern Music API uses for
-per-user requests. You obtain it out-of-band - typically from an iOS
-device, an Apple Music web session, or a separate token-extraction tool.
-This wrapper never accepts an Apple ID password and does not run sign-in
-flows; the token *is* the credential.
+Sign-in matches the legacy wrapper model: you send **email (Apple ID) and password**
+to the daemon; it fills credentials through the native presentation interface.
+With a persistent `WRAPPER_BASE_DIR` volume, Apple keeps `mpl_db/kvs.sqlitedb` on
+disk. On each process start the daemon tries **session restore** (default
+`WRAPPER_RESTORE_SESSION=1`): if that session is still valid, `GET /me` can show
+**authenticated** and fresh tokens **without** another `POST /login`. Use
+`POST /login` when the volume is new, restore fails, or you need to re-auth.
+Optional `WRAPPER_APPLE_ID` only sets the `apple_id` label in `/me` after restore.
 
 ## Layout
 
@@ -61,8 +66,10 @@ flows; the token *is* the credential.
 │   │   ├── server.{hpp,cpp}  HTTP route mounting (cpp-httplib)
 │   │   └── apple/
 │   │       ├── abi.hpp       Apple-lib mangled symbol declarations
-│   │       ├── auth.{hpp,cpp}    Media User Token storage
-│   │       └── runtime.{hpp,cpp} FootHillConfig + DeviceGUID + RequestContext init
+│   │       ├── auth.{hpp,cpp}    Apple ID login + 2FA + token cache
+│   │       ├── loader.{hpp,cpp}  dlopen / dlsym
+│   │       ├── runtime.{hpp,cpp} FootHillConfig + RequestContext + credential UI
+│   │       └── tokens.{hpp,cpp}  dev token + music user token harvest
 │   └── launcher/
 │       └── wrapper.c         host-Linux chroot launcher
 ├── rootfs/                   chroot tree assembled at build time
@@ -77,7 +84,7 @@ flows; the token *is* the credential.
     └── android-system/       linker64 + bionic + AOSP libs, SHA-pinned
         └── x86_64/
             ├── bin/linker64
-            └── lib64/{libc, libm, libstdc++, liblog, libz, libandroid, libOpenSLES}.so
+            └── lib64/*.so
 ```
 
 ## Building
@@ -117,11 +124,11 @@ docker compose up --build
 curl http://127.0.0.1/health
 curl http://127.0.0.1/me
 
-# 6. Cache a Media User Token.
+# 6. Sign in (use your real Apple ID; 2FA may require a second request).
 curl -X POST http://127.0.0.1/login \
      -H 'content-type: application/json' \
-     -d '{"media_user_token": "AyL...your-token..."}'
-curl http://127.0.0.1/me        # logged_in: true
+     -d '{"username":"you@example.com","password":"your-app-specific-password"}'
+curl http://127.0.0.1/me
 curl -X DELETE http://127.0.0.1/login
 ```
 
@@ -137,6 +144,10 @@ The daemon reads `WRAPPER_*` environment variables (forwarded via
 - `WRAPPER_HOST`, `WRAPPER_PORT` - bind address inside the chroot.
 - `WRAPPER_BASE_DIR` - filesystem dir Apple's libs use for the FairPlay
   key cache and `mpl_db`. The default matches upstream wrapper.
+- `WRAPPER_RESTORE_SESSION` - set to `0` to skip startup token harvest from
+  an existing on-disk Apple session (default is restore on).
+- `WRAPPER_APPLE_ID` - optional display label for `apple_id` in `GET /me` after
+  session restore only (not sent to Apple).
 - `WRAPPER_DEVICE_INFO` - 9-tuple identifying the fake Apple Music
   Android client. Same fingerprint upstream uses by default.
 - `WRAPPER_APPLE_INIT=0` - skip Apple lib initialization at startup.

@@ -49,7 +49,8 @@ public:
     // are no-ops returning true. On failure the runtime stays
     // uninitialized and subsequent calls will retry. Errors are
     // logged to stderr with a `runtime: ` prefix. The Loader must
-    // remain alive for the lifetime of the process.
+    // outlive the runtime - we cache a pointer for credential
+    // trampoline access.
     bool initialize(const Loader& loader, const RuntimeConfig& cfg);
 
     bool initialized() const { return initialized_.load(std::memory_order_acquire); }
@@ -58,6 +59,17 @@ public:
     // Empty string if not initialized yet.
     std::string base_dir() const;
     std::string device_info() const;
+
+    // Read-only access used by the auth worker thread (Phase 1.1+).
+    // Both methods return zero-initialized values if not initialized.
+    abi::shared_ptr request_ctx_copy() const;
+    abi::shared_ptr device_guid_copy() const;
+    abi::shared_ptr presentation_interface_copy() const;
+
+    // Loader pointer captured at initialize() time. Used by the C-style
+    // credential handler trampoline which can't carry a user-data
+    // pointer through Apple's callback ABI.
+    const Loader* loader() const { return loader_; }
 
 private:
     Runtime() = default;
@@ -69,11 +81,14 @@ private:
     bool init_request_context(const Symbols& s,
                               const RuntimeConfig& cfg,
                               const std::vector<std::string>& parts);
+    bool init_presentation_interface(const Symbols& s);
 
     mutable std::mutex mu_;
     std::atomic<bool> initialized_{false};
+    const Loader* loader_ = nullptr;
     abi::shared_ptr request_ctx_{};
     abi::shared_ptr device_guid_{};
+    abi::shared_ptr presentation_interface_{};
     std::string base_dir_;
     std::string device_info_;
 };

@@ -20,9 +20,8 @@ ARG RUNTIME_PLATFORM=linux/amd64
 FROM --platform=${BUILD_PLATFORM} debian:13.2 AS build
 
 ARG TARGET_ARCH=x86_64
+ARG CMAKE_BUILD_TYPE=Release
 ARG NDK_VERSION=23
-ARG WRAPPER_DEBUG_HOOKS=OFF
-
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -62,8 +61,7 @@ RUN test -f rootfs/system/bin/linker64 || { \
 
 RUN cmake -S . -B build -G Ninja \
         -DTARGET_ARCH=${TARGET_ARCH} \
-        -DWRAPPER_DEBUG_HOOKS=${WRAPPER_DEBUG_HOOKS} \
-        -DCMAKE_BUILD_TYPE=Release && \
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     cmake --build build -j
 
 # -----------------------------------------------------------------------------
@@ -76,7 +74,11 @@ WORKDIR /app
 COPY --from=build /app/wrapper        /app/wrapper
 COPY --from=build /app/rootfs         /app/rootfs
 
+# Apple's libcurl inside the chroot needs CA certificates for SSL verification.
+# The build stage has ca-certificates installed; copy the bundle into the rootfs
+# where the launcher will point SSL_CERT_FILE / CURL_CA_BUNDLE at it.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /app/rootfs/etc/ssl/certs/ca-certificates.crt
+
 EXPOSE 80
 
 ENTRYPOINT ["/app/wrapper"]
-CMD ["--host", "0.0.0.0", "--port", "80"]

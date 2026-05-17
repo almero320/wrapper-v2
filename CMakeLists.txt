@@ -33,7 +33,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(TARGET_ARCH "x86_64" CACHE STRING "Target arch for the chrooted daemon (x86_64 only in Phase 0)")
 set_property(CACHE TARGET_ARCH PROPERTY STRINGS "x86_64")
 
-option(WRAPPER_DEBUG_HOOKS "Build with Dobby-based debug hooks (cert-pinning bypass, log tracing)" OFF)
 option(WRAPPER_BUILD_DAEMON "Drive the NDK sub-build for the chrooted daemon" ON)
 
 # -----------------------------------------------------------------------------
@@ -105,7 +104,6 @@ if(WRAPPER_BUILD_DAEMON)
             -DANDROID_PLATFORM=android-21
             -DANDROID_STL=c++_shared
             -DCMAKE_BUILD_TYPE=$<IF:$<CONFIG:Debug>,Debug,Release>
-            -DWRAPPER_DEBUG_HOOKS=${WRAPPER_DEBUG_HOOKS}
             -DLIBS_DIR=${CMAKE_SOURCE_DIR}/rootfs/system/lib64
         COMMAND ${CMAKE_COMMAND} --build "${_daemon_build}" -j
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/rootfs/system/bin"
@@ -124,7 +122,6 @@ endif()
 # -----------------------------------------------------------------------------
 message(STATUS "wrapper-v2:")
 message(STATUS "  TARGET_ARCH         = ${TARGET_ARCH}")
-message(STATUS "  WRAPPER_DEBUG_HOOKS = ${WRAPPER_DEBUG_HOOKS}")
 message(STATUS "  WRAPPER_BUILD_DAEMON= ${WRAPPER_BUILD_DAEMON}")
 if(WRAPPER_BUILD_DAEMON)
     message(STATUS "  NDK_PATH            = ${NDK_PATH}")

@@ -1,13 +1,14 @@
 // Port of upstream main.c::init() + init_ctx() to C++.
 //
 // Behavioral diffs vs. upstream:
-//   - We do NOT install a presentation interface (no dialog/credential
-//     handlers). Phase 1.0 never triggers AuthenticateFlow::run, so
-//     these slots are never called.
+//   - We install a presentation interface with credential + dialog
+//     handlers. The dialog handler auto-selects "Use Existing Apple ID"
+//     when the title is "Sign In" (same as upstream), and always calls
+//     handleProtocolDialogResponse so AuthenticateFlow does not stall.
 //   - We do NOT spin up SVPlaybackLeaseManager. That's a decryption
 //     prerequisite and lives in Phase 1.4.
-//   - We log to stderr with a `runtime:` prefix instead of the
-//     upstream `[+] ...` prefix.
+//   - Errors during init log to stderr; credential + ProtocolDialog
+//     callbacks log a single line each to stderr (no secrets).
 //
 // All Apple calls are unchecked: there are no error returns to
 // validate. If an Apple call crashes mid-init, we want the process to
@@ -20,13 +21,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <sstream>
+#include <string>
+
+#include "apple/auth.hpp"
 
 namespace wrapper::apple {
 
 namespace {
 
 constexpr int kDeviceInfoPartCount = 9;
+
+// Apple's CredentialsResponse setters can retain references to string storage
+// past the callback return. Upstream passes global char buffers; keep equivalent
+// process-lifetime storage here rather than local std::string::c_str() pointers.
+std::string g_credential_username;
+std::string g_credential_password;
 
 // Split "a/b/c/d/.../i" into 9 string parts. Returns empty vector
 // if the count doesn't match (the runtime considers that a hard
@@ -44,6 +55,145 @@ std::vector<std::string> split_device_info(const std::string& s) {
         out.clear();
     }
     return out;
+}
+
+std::string read_apple_string(const abi::std_string* s) {
+    if (s == nullptr) return {};
+    const bool is_long = (s->_long.cap & 1u) != 0;
+    if (is_long) {
+        if (s->_long.data == nullptr || s->_long.size == 0) return {};
+        return std::string(s->_long.data, s->_long.size);
+    }
+    const std::size_t len = s->_short.mark >> 1;
+    return std::string(s->_short.str, len);
+}
+
+// Single-line stderr (no raw newlines / control chars).
+std::string sanitize_log_chunk(std::string x, std::size_t max_len) {
+    for (char& c : x) {
+        if (static_cast<unsigned char>(c) < 0x20) c = ' ';
+    }
+    if (x.size() > max_len) {
+        x.resize(max_len);
+        x += "...";
+    }
+    return x;
+}
+
+// ----------------------------------------------------------------------
+// Callbacks registered on AndroidPresentationInterface.
+//
+// Apple's setDialogHandler / setCredentialsHandler store a function pointer
+// typed as taking std::shared_ptr<T> by value. On x86_64 Itanium ABI,
+// std::shared_ptr has a non-trivial copy ctor/dtor, so it is passed
+// *indirectly*: the caller puts a pointer to a temporary in %rdi/%rsi.
+// Declaring the callbacks with explicit shared_ptr* parameters matches that
+// calling convention exactly — same as the upstream C wrapper (main.c).
+// Do NOT use by-value abi::shared_ptr here: abi::shared_ptr is trivially
+// copyable so the compiler would expect its fields in registers, creating
+// a fatal ABI mismatch.
+// ----------------------------------------------------------------------
+
+extern "C" void wrapper_dialog_handler(long dialog_id,
+                                       abi::shared_ptr* dialog,
+                                       abi::shared_ptr* /* response_handler */) {
+    Runtime& rt = Runtime::instance();
+    const Loader* loader = rt.loader();
+    if (loader == nullptr || !loader->ok()) return;
+    if (dialog == nullptr || dialog->obj == nullptr) return;
+
+    const Symbols& sy = loader->sym();
+    std::string title   = read_apple_string(sy.ProtocolDialog_title(dialog->obj));
+    abi::shared_ptr apInf = rt.presentation_interface_copy();
+    if (apInf.obj == nullptr) return;
+
+    // Allocate with ::operator new so libc++'s shared_ptr control-block
+    // teardown matches the allocator (malloc + operator delete is UB).
+    auto* const emplace = static_cast<std::uint8_t*>(::operator new(72));
+    std::memset(emplace + 8, 0, 16);
+    *reinterpret_cast<void**>(emplace) = sy.vtable_ProtocolDialogResponse + 2;
+    abi::shared_ptr diag_resp;
+    diag_resp.obj      = emplace + 24;
+    diag_resp.ctrl_blk = emplace;
+    sy.ProtocolDialogResponse_ctor(diag_resp.obj);
+
+    std::vector<std::string> button_labels;
+    bool auto_picked = false;
+    abi::std_vector* buttons = sy.ProtocolDialog_buttons(dialog->obj);
+    if (buttons != nullptr && buttons->begin != nullptr && buttons->end != nullptr) {
+        auto* b_begin = static_cast<abi::shared_ptr*>(buttons->begin);
+        auto* b_end   = static_cast<abi::shared_ptr*>(buttons->end);
+        for (auto* b = b_begin; b != b_end; ++b) {
+            if (b->obj == nullptr) continue;
+            std::string bt = read_apple_string(sy.ProtocolButton_title(b->obj));
+            const bool is_existing = (bt == "Use Existing Apple ID");
+            button_labels.push_back(sanitize_log_chunk(std::move(bt), 80));
+            if (!auto_picked && title == "Sign In" && is_existing) {
+                sy.ProtocolDialogResponse_setSelectedButton(diag_resp.obj, b);
+                auto_picked = true;
+            }
+        }
+    }
+
+    {
+        std::string joined;
+        for (std::size_t i = 0; i < button_labels.size(); ++i) {
+            if (i != 0) joined += ", ";
+            joined += button_labels[i];
+        }
+        joined = sanitize_log_chunk(std::move(joined), 400);
+        std::string title_log = sanitize_log_chunk(std::move(title), 200);
+        std::fprintf(stderr,
+                     "runtime: ProtocolDialog id=%ld title=\"%s\" buttons=[%s] "
+                     "picked_existing_apple_id=%s\n",
+                     static_cast<long>(dialog_id), title_log.c_str(), joined.c_str(),
+                     auto_picked ? "yes" : "no");
+    }
+
+    long id_arg = dialog_id;
+    sy.API_handleProtocolDialogResponse(apInf.obj, &id_arg, &diag_resp);
+    // Ownership of emplace follows Apple's shared_ptr refcount; do not free here.
+}
+
+extern "C" void wrapper_credential_handler(abi::shared_ptr* cred_request,
+                                           abi::shared_ptr* /* cred_response_handler */) {
+    Runtime& rt = Runtime::instance();
+    const Loader* loader = rt.loader();
+    if (loader == nullptr || !loader->ok()) return;
+    const Symbols& s = loader->sym();
+    abi::shared_ptr apInf = rt.presentation_interface_copy();
+    if (apInf.obj == nullptr) return;
+
+    const bool need_2fa =
+        (cred_request != nullptr && cred_request->obj != nullptr)
+        ? (s.CR_requiresHSA2VerificationCode(cred_request->obj) != 0)
+        : false;
+
+    std::fprintf(stderr,
+                 "runtime: CredentialsRequest HSA2=%s\n",
+                 need_2fa ? "yes" : "no");
+
+    std::string username, password;
+    Account::instance().fetch_credentials_blocking(&username, &password, need_2fa);
+    g_credential_username = std::move(username);
+    g_credential_password = std::move(password);
+
+    auto* const emplace = static_cast<std::uint8_t*>(::operator new(80));
+    std::memset(emplace + 8, 0, 16);
+    *reinterpret_cast<void**>(emplace) = s.vtable_CredentialsResponse + 2;
+    abi::shared_ptr cred_resp;
+    cred_resp.obj      = emplace + 24;
+    cred_resp.ctrl_blk = emplace;
+
+    s.CredentialsResponse_ctor(cred_resp.obj);
+    auto user_view = abi::make_string_view(g_credential_username.c_str());
+    s.CredentialsResponse_setUserName(cred_resp.obj, &user_view);
+    auto pass_view = abi::make_string_view(g_credential_password.c_str());
+    s.CredentialsResponse_setPassword(cred_resp.obj, &pass_view);
+    s.CredentialsResponse_setResponseType(cred_resp.obj, /*kSubmit=*/2);
+
+    s.API_handleCredentialsResponse(apInf.obj, &cred_resp);
+    // Ownership of emplace follows Apple's shared_ptr refcount; do not free here.
 }
 
 }  // namespace
@@ -75,18 +225,16 @@ bool Runtime::initialize(const Loader& loader, const RuntimeConfig& cfg) {
         return false;
     }
 
-    std::fprintf(stderr, "runtime: starting Apple lib init (base_dir=%s)\n",
-                 cfg.base_dir.c_str());
-
     const Symbols& s = loader.sym();
     if (!init_dns_and_foothill(s, parts)) return false;
     if (!init_request_context(s, cfg, parts)) return false;
+    if (!init_presentation_interface(s)) return false;
 
     base_dir_ = cfg.base_dir;
     device_info_ = cfg.device_info;
+    loader_ = &loader;
     initialized_.store(true, std::memory_order_release);
 
-    std::fprintf(stderr, "runtime: ready\n");
     return true;
 }
 
@@ -136,10 +284,11 @@ bool Runtime::init_request_context(const Symbols& s,
         return false;
     }
 
-    // RequestContextConfig: emplaced in a stack-ish 480-byte buffer
-    // with a hand-rolled vtable pointer for the shared_ptr control
-    // block. Pattern lifted verbatim from upstream init_ctx().
-    static std::uint8_t rcc_buf[480];
+    // RequestContextConfig: emplaced in a buffer with a hand-rolled vtable
+    // pointer for the shared_ptr control block. Pattern from upstream
+    // init_ctx(), with extra slack so Release builds do not stomp adjacent
+    // storage if Apple's object is larger than the historical constant.
+    alignas(16) static std::uint8_t rcc_buf[2048];
     *reinterpret_cast<void**>(rcc_buf) =
         s.vtable_RequestContextConfig + 2;  // skip past vtable header (type_info + dtor slots)
 
@@ -190,6 +339,24 @@ bool Runtime::init_request_context(const Symbols& s,
     return true;
 }
 
+bool Runtime::init_presentation_interface(const Symbols& s) {
+    // make_shared<AndroidPresentationInterface>()
+    s.make_shared_AndroidPresentationInterface(&presentation_interface_);
+    if (presentation_interface_.obj == nullptr) {
+        std::fprintf(stderr,
+                     "runtime: make_shared<AndroidPresentationInterface> returned null\n");
+        return false;
+    }
+
+    s.API_setDialogHandler(presentation_interface_.obj, &wrapper_dialog_handler);
+    s.API_setCredentialsHandler(presentation_interface_.obj, &wrapper_credential_handler);
+
+    // Wire the apInf into the RequestContext so AuthenticateFlow can
+    // surface credential prompts back to us.
+    s.RequestContext_setPresentationInterface(request_ctx_.obj, &presentation_interface_);
+    return true;
+}
+
 std::string Runtime::base_dir() const {
     if (!initialized_.load(std::memory_order_acquire)) return {};
     std::lock_guard<std::mutex> g(mu_);
@@ -200,6 +367,24 @@ std::string Runtime::device_info() const {
     if (!initialized_.load(std::memory_order_acquire)) return {};
     std::lock_guard<std::mutex> g(mu_);
     return device_info_;
+}
+
+abi::shared_ptr Runtime::request_ctx_copy() const {
+    if (!initialized_.load(std::memory_order_acquire)) return {};
+    std::lock_guard<std::mutex> g(mu_);
+    return request_ctx_;
+}
+
+abi::shared_ptr Runtime::device_guid_copy() const {
+    if (!initialized_.load(std::memory_order_acquire)) return {};
+    std::lock_guard<std::mutex> g(mu_);
+    return device_guid_;
+}
+
+abi::shared_ptr Runtime::presentation_interface_copy() const {
+    if (!initialized_.load(std::memory_order_acquire)) return {};
+    std::lock_guard<std::mutex> g(mu_);
+    return presentation_interface_;
 }
 
 }  // namespace wrapper::apple

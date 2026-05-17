@@ -33,19 +33,6 @@ FetchContent_Declare(
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(nlohmann_json)
 
-# Dobby (optional): function hooking for debug-only cert-pinning bypass.
-option(WRAPPER_DEBUG_HOOKS "Build with Dobby-based debug hooks" OFF)
-if(WRAPPER_DEBUG_HOOKS)
-    FetchContent_Declare(
-        dobby
-        GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-        GIT_TAG        master
-        GIT_SHALLOW    TRUE
-    )
-    set(DOBBY_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-    set(DOBBY_BUILD_TEST    OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(dobby)
-endif()
 
 # -----------------------------------------------------------------------------
 # Daemon executable
@@ -56,6 +43,7 @@ add_executable(main
     apple/auth.cpp
     apple/loader.cpp
     apple/runtime.cpp
+    apple/tokens.cpp
 )
 
 target_include_directories(main PRIVATE
@@ -67,15 +55,11 @@ target_link_libraries(main PRIVATE
     nlohmann_json::nlohmann_json
 )
 
-if(WRAPPER_DEBUG_HOOKS)
-    target_link_libraries(main PRIVATE dobby)
-    target_compile_definitions(main PRIVATE WRAPPER_DEBUG_HOOKS=1)
-endif()
-
 target_compile_options(main PRIVATE
     -Wall -Wextra -Wpedantic -Werror=return-type
     -fexceptions
 )
+
 # RTTI is intentionally on. nlohmann::json compiles fine with or
 # without it but cpp-httplib's exception path uses typeid lookups,
 # and we share libc++_shared.so with Apple's libs which were also

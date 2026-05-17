@@ -12,10 +12,28 @@ namespace wrapper {
 namespace {
 
 using nlohmann::json;
+using namespace std::chrono_literals;
+
+// How long POST /login is willing to block waiting for AuthenticateFlow
+// to settle to a terminal state (Authenticated/Failed) or to Awaiting2FA.
+// Apple's flow normally completes well within a couple of seconds when
+// no 2FA is needed; the credentialHandler dispatch is what controls
+// when this returns.
+constexpr auto kLoginPhase1Timeout = 30s;
+
+// How long POST /login/2fa is willing to block after submitting the
+// code. The flow has to make a network round-trip back to Apple.
+constexpr auto kLogin2faTimeout    = 60s;
 
 void respond_json(httplib::Response& res, int status, json body) {
     res.status = status;
     res.set_content(body.dump(), "application/json");
+}
+
+void access_log(const char* method, const httplib::Request& req) {
+    const std::string& peer = req.remote_addr;
+    const char* p = peer.empty() ? "-" : peer.c_str();
+    std::fprintf(stderr, "http: %s %s client=%s\n", method, req.path.c_str(), p);
 }
 
 std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
@@ -32,26 +50,72 @@ std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
     return buf;
 }
 
+json snapshot_to_json(const apple::AccountSnapshot& snap) {
+    json out;
+    out["state"] = apple::to_string(snap.state);
+    if (!snap.apple_id.empty()) {
+        out["apple_id"] = snap.apple_id;
+        out["username"] = snap.apple_id;
+    }
+    if (snap.state == apple::LoginState::Authenticated) {
+        if (!snap.storefront.empty())       out["storefront"]       = snap.storefront;
+        if (!snap.dsid.empty())             out["dsid"]             = snap.dsid;
+        if (!snap.music_user_token.empty()) out["music_user_token"] = snap.music_user_token;
+        if (!snap.dev_token.empty())        out["dev_token"]        = snap.dev_token;
+        out["logged_in_at"] = iso8601_utc(snap.logged_in_at);
+    }
+    if (snap.state == apple::LoginState::Failed) {
+        if (!snap.last_error.empty()) out["error"] = snap.last_error;
+        if (snap.last_error_code != 0) out["error_code"] = snap.last_error_code;
+    }
+    return out;
+}
+
+json runtime_to_json(const apple::Loader& loader,
+                       const apple::Runtime& rt,
+                       const ServerInfo& info) {
+    json runtime = {
+        {"apple_init_enabled", info.apple_init_enabled},
+        {"loader_ok",          loader.ok()},
+        {"initialized",        rt.initialized()},
+    };
+    if (!loader.ok() && !loader.last_error().empty()) {
+        runtime["loader_error"] = loader.last_error();
+    }
+    if (rt.initialized()) {
+        runtime["base_dir"] = rt.base_dir();
+        runtime["device_info"] = rt.device_info();
+    }
+    return runtime;
+}
+
+int http_status_for(apple::LoginState s) {
+    switch (s) {
+        case apple::LoginState::Authenticated: return 200;
+        case apple::LoginState::Awaiting2FA:   return 202;
+        case apple::LoginState::Failed:        return 401;
+        case apple::LoginState::InProgress:    return 504;
+        case apple::LoginState::LoggedOut:     return 400;
+    }
+    return 500;
+}
+
 }  // namespace
 
 Server::Server(httplib::Server& svr,
                apple::Runtime& rt,
                apple::Loader& loader,
-               apple::AuthState& auth,
+               apple::Account& account,
                ServerInfo info)
-    : svr_(svr), rt_(rt), loader_(loader), auth_(auth), info_(std::move(info)) {}
+    : svr_(svr), rt_(rt), loader_(loader), account_(account), info_(std::move(info)) {}
 
 void Server::mount() {
-    svr_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
-        json body = {
-            {"status", "ok"},
-            {"phase", 1},
-            {"version", info_.version},
-        };
-        respond_json(res, 200, std::move(body));
-    });
-
-    svr_.Get("/me", [this](const httplib::Request&, httplib::Response& res) {
+    // ---- GET /health ----
+    // Liveness + runtime debug info. Always returns 200 if the
+    // process is up; consumers should treat runtime.initialized==false
+    // as a soft failure (auth/decrypt won't work) rather than a hard one.
+    svr_.Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
+        access_log("GET", req);
         json runtime = {
             {"apple_init_enabled", info_.apple_init_enabled},
             {"loader_ok",          loader_.ok()},
@@ -64,75 +128,181 @@ void Server::mount() {
             runtime["base_dir"] = rt_.base_dir();
             runtime["device_info"] = rt_.device_info();
         }
-
-        json auth = {{"logged_in", auth_.logged_in()}};
-        if (auth_.logged_in()) {
-            auth["media_user_token_preview"] = auth_.token_preview();
-            auth["logged_in_at"] = iso8601_utc(auth_.logged_in_at());
-        }
-
         respond_json(res, 200, json{
-            {"runtime", std::move(runtime)},
-            {"auth", std::move(auth)},
+            {"status",  "ok"},
+            {"phase",   1.1},
             {"version", info_.version},
+            {"runtime", std::move(runtime)},
         });
     });
 
+    // ---- GET /me ----
+    // Combined daemon snapshot: version, runtime probe (same facts as
+    // /health.runtime), and auth (Apple ID state + harvested tokens after
+    // a successful POST /login). iTunes account-token / X-Token are NOT
+    // exposed — only dev_token, music_user_token, storefront, dsid.
+    svr_.Get("/me", [this](const httplib::Request& req, httplib::Response& res) {
+        access_log("GET", req);
+        json body = {
+            {"version", info_.version},
+            {"runtime", runtime_to_json(loader_, rt_, info_)},
+            {"auth", snapshot_to_json(account_.public_snapshot())},
+        };
+        respond_json(res, 200, std::move(body));
+    });
+
+    // ---- POST /login ----
+    // Body: { "username": "...", "password": "..." }
+    //    or { "apple_id": "...", "password": "..." } (synonyms)
+    // Returns:
+    //   200 if AuthenticateFlow completed (state=authenticated, tokens present)
+    //   202 if Apple asked for HSA2 (state=awaiting_2fa) - follow up with
+    //       POST /login/2fa
+    //   401 if Apple rejected credentials (state=failed)
+    //   409 if a login is already in progress
+    //   503 if the runtime is not initialized
+    //   504 if the flow has not produced any state inside kLoginPhase1Timeout
     svr_.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
-        json req_body;
-        try {
-            req_body = json::parse(req.body);
-        } catch (const std::exception& e) {
-            respond_json(res, 400, json{
-                {"error", "invalid_json"},
-                {"detail", e.what()},
+        access_log("POST", req);
+        if (!rt_.initialized()) {
+            respond_json(res, 503, json{
+                {"error", "runtime_not_initialized"},
+                {"detail", "Apple lib init has not completed; check /health"},
             });
             return;
         }
 
-        if (!req_body.is_object() || !req_body.contains("media_user_token")
-            || !req_body["media_user_token"].is_string()) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception& e) {
+            respond_json(res, 400, json{{"error", "invalid_json"}, {"detail", e.what()}});
+            return;
+        }
+        if (!body.is_object() || !body.contains("password")
+            || !body["password"].is_string()) {
             respond_json(res, 400, json{
                 {"error", "missing_field"},
-                {"detail", "expected JSON object with string 'media_user_token'"},
+                {"detail", "expected JSON object with string 'password' and "
+                            "'username' or 'apple_id'"},
             });
             return;
         }
-
-        std::string token = req_body["media_user_token"].get<std::string>();
-        if (token.empty()) {
+        std::string login_name;
+        const bool has_apple =
+            body.contains("apple_id") && body["apple_id"].is_string();
+        const bool has_user =
+            body.contains("username") && body["username"].is_string();
+        if (has_apple && has_user) {
+            std::string a = body["apple_id"].get<std::string>();
+            std::string u = body["username"].get<std::string>();
+            if (a != u) {
+                respond_json(res, 400, json{
+                    {"error", "conflicting_identifiers"},
+                    {"detail", "'username' and 'apple_id' must match if both are sent"},
+                });
+                return;
+            }
+            login_name = std::move(a);
+        } else if (has_apple) {
+            login_name = body["apple_id"].get<std::string>();
+        } else if (has_user) {
+            login_name = body["username"].get<std::string>();
+        } else {
             respond_json(res, 400, json{
-                {"error", "empty_token"},
-                {"detail", "media_user_token must be non-empty; use DELETE /login to clear"},
+                {"error", "missing_field"},
+                {"detail", "expected 'username' or 'apple_id' string"},
+            });
+            return;
+        }
+        std::string password = body["password"].get<std::string>();
+        if (login_name.empty() || password.empty()) {
+            respond_json(res, 400, json{
+                {"error", "empty_field"},
+                {"detail", "username/apple_id and password must be non-empty"},
             });
             return;
         }
 
-        auth_.set_media_user_token(std::move(token));
-        std::fprintf(stderr, "server: stored media_user_token (preview=%s)\n",
-                     auth_.token_preview().c_str());
-
-        respond_json(res, 200, json{
-            {"logged_in", true},
-            {"media_user_token_preview", auth_.token_preview()},
-            {"logged_in_at", iso8601_utc(auth_.logged_in_at())},
-        });
-    });
-
-    svr_.Delete("/login", [this](const httplib::Request&, httplib::Response& res) {
-        bool was_logged_in = auth_.logged_in();
-        auth_.clear();
-        if (was_logged_in) {
-            std::fprintf(stderr, "server: cleared media_user_token\n");
+        if (!account_.start_login(loader_, rt_, std::move(login_name), std::move(password))) {
+            if (account_.state() == apple::LoginState::Authenticated) {
+                respond_json(res, 409, json{
+                    {"error", "already_authenticated"},
+                    {"detail", "call DELETE /login before signing in again"},
+                });
+                return;
+            }
+            respond_json(res, 409, json{
+                {"error", "already_in_progress"},
+                {"detail", "a login flow is already running; DELETE /login to abort"},
+            });
+            return;
         }
+
+        auto state = account_.wait_for_settled_state(kLoginPhase1Timeout);
+        respond_json(res, http_status_for(state), snapshot_to_json(account_.public_snapshot()));
+    });
+
+    // ---- POST /login/2fa ----
+    // Body: { "code": "123456" }
+    // Returns 200 / 401 / 409 / 504 with the same shape as /login.
+    svr_.Post("/login/2fa", [this](const httplib::Request& req, httplib::Response& res) {
+        access_log("POST", req);
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception& e) {
+            respond_json(res, 400, json{{"error", "invalid_json"}, {"detail", e.what()}});
+            return;
+        }
+        if (!body.is_object() || !body.contains("code") || !body["code"].is_string()) {
+            respond_json(res, 400, json{
+                {"error", "missing_field"},
+                {"detail", "expected JSON object with string 'code'"},
+            });
+            return;
+        }
+        std::string code = body["code"].get<std::string>();
+        if (code.empty()) {
+            respond_json(res, 400, json{
+                {"error", "empty_code"},
+                {"detail", "code must be non-empty"},
+            });
+            return;
+        }
+
+        if (!account_.submit_2fa(std::move(code))) {
+            respond_json(res, 409, json{
+                {"error", "not_awaiting_2fa"},
+                {"detail", "no login is currently waiting for a 2FA code; "
+                           "start one with POST /login"},
+            });
+            return;
+        }
+
+        auto state = account_.wait_for_settled_state(kLogin2faTimeout);
+        respond_json(res, http_status_for(state), snapshot_to_json(account_.public_snapshot()));
+    });
+
+    // ---- DELETE /login ----
+    // Clears in-memory tokens and (if a flow is running) signals the
+    // worker thread to abort. Apple's kvs.sqlitedb cache is NOT
+    // touched; the next POST /login will reuse it if still valid.
+    svr_.Delete("/login", [this](const httplib::Request& req, httplib::Response& res) {
+        access_log("DELETE", req);
+        auto prev = account_.state();
+        account_.logout();
         respond_json(res, 200, json{
-            {"logged_in", false},
-            {"cleared", was_logged_in},
+            {"state", apple::to_string(account_.state())},
+            {"was",   apple::to_string(prev)},
         });
     });
 
-    svr_.set_exception_handler([](const httplib::Request&, httplib::Response& res,
+    // ---- exception fallback ----
+    svr_.set_exception_handler([](const httplib::Request& req, httplib::Response& res,
                                   std::exception_ptr ep) {
+        std::fprintf(stderr, "http: exception %s %s\n",
+                     req.method.c_str(), req.path.c_str());
         std::string what = "unknown";
         try {
             if (ep) std::rethrow_exception(ep);

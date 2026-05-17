@@ -9,10 +9,11 @@
  * dependency on the daemon's HTTP code or on the Apple libs.
  *
  * Differences vs upstream wrapper.c:
- *   - No gengetopt; argument parsing is done inside the daemon and forwarded
- *     verbatim. The launcher only handles the chroot setup.
- *   - --base-dir handling is handled by the daemon itself; the launcher only
- *     ensures the directory exists if requested via WRAPPER_BASE_DIR env var.
+ *   - No gengetopt; the daemon reads configuration from the environment
+ *     (WRAPPER_*). The launcher forwards argv unchanged (use --help only).
+ *   - --base-dir handling is handled by the daemon itself; the launcher
+ *     mkdir -p's WRAPPER_BASE_DIR (or the same default path as the daemon)
+ *     plus mpl_db before exec.
  *   - SIGTERM is forwarded to the daemon (upstream only handled SIGINT).
  */
 
@@ -31,12 +32,17 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern char** environ;
+
 #define CAP_SYS_ADMIN_IDX 21
 #define CAP_SYS_ADMIN_BIT (1ULL << CAP_SYS_ADMIN_IDX)
 
 #define ROOTFS         "./rootfs"
 #define DAEMON_PATH    "/system/bin/main"
 #define LINKER_PATH    "/system/bin/linker64"
+
+/* Same default as daemon RuntimeConfig (runtime.hpp). */
+static const char k_default_base_dir[] = "/data/data/com.apple.android.music/files";
 
 static volatile pid_t g_child = -1;
 
@@ -72,7 +78,27 @@ static int ensure_dir(const char* path, mode_t mode) {
     return -1;
 }
 
+static int ensure_dir_p(const char* path, mode_t mode) {
+    if (path == NULL || *path == '\0') return -1;
+    char buf[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(buf)) {
+        fprintf(stderr, "wrapper: path too long for mkdir -p\n");
+        return -1;
+    }
+    memcpy(buf, path, n + 1);
+    for (char* p = buf + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            if (ensure_dir(buf, mode) != 0) return -1;
+            *p = '/';
+        }
+    }
+    return ensure_dir(buf, mode);
+}
+
 int main(int argc, char* argv[], char* envp[]) {
+    (void)envp;
     struct sigaction sa = {0};
     sa.sa_handler = on_signal;
     sigaction(SIGINT,  &sa, NULL);
@@ -136,14 +162,30 @@ int main(int argc, char* argv[], char* envp[]) {
     }
 
     const char* base_dir = getenv("WRAPPER_BASE_DIR");
-    if (base_dir && *base_dir) {
-        ensure_dir(base_dir, 0777);
-        char db_dir[1024];
-        snprintf(db_dir, sizeof(db_dir), "%s/mpl_db", base_dir);
-        ensure_dir(db_dir, 0777);
+    if (base_dir == NULL || base_dir[0] == '\0') {
+        base_dir = k_default_base_dir;
     }
+    if (ensure_dir_p(base_dir, 0777) != 0) return 1;
+    char db_dir[1024];
+    if (snprintf(db_dir, sizeof(db_dir), "%s/mpl_db", base_dir) >= (int)sizeof(db_dir)) {
+        fprintf(stderr, "wrapper: mpl_db path too long\n");
+        return 1;
+    }
+    if (ensure_dir_p(db_dir, 0777) != 0) return 1;
 
-    execve(DAEMON_PATH, argv, envp);
+    /* Bionic DNS resolver behavior; upstream wrapper sets this in init(). */
+    setenv("ANDROID_DNS_MODE", "local", 1);
+
+    /* Bionic internals (timezone, SSL cert paths, etc.) expect these. */
+    setenv("ANDROID_DATA", "/data", 0);
+    setenv("ANDROID_ROOT", "/system", 0);
+
+    /* Point libcurl / OpenSSL at the CA bundle so SSL verification works. */
+    setenv("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt", 0);
+    setenv("CURL_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt", 0);
+
+    /* Pass environ so setenv() changes are visible (execve's envp is static). */
+    execve(DAEMON_PATH, argv, environ);
     fprintf(stderr, "wrapper: execve %s: %s\n", DAEMON_PATH, strerror(errno));
     return 1;
 }

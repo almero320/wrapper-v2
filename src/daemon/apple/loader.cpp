@@ -44,6 +44,26 @@ bool resolve(void* h, const char* name, T* out, std::string* err_out) {
     return true;
 }
 
+// Vtable symbols are data objects rather than function pointers, so
+// `resolve<>` (which casts to a function pointer) is the wrong shape.
+// We reuse dlsym's RTLD_DEFAULT lookup and cast to void** so callers
+// can do the upstream-style "skip the type_info + dtor slots" pointer
+// arithmetic.
+bool resolve_vtable(const char* name, void*** out, std::string* err_out) {
+    dlerror();
+    void* sym = dlsym(RTLD_DEFAULT, name);
+    const char* msg = dlerror();
+    if (sym == nullptr || msg != nullptr) {
+        if (err_out) {
+            *err_out = std::string("dlsym(") + name + "): " + (msg ? msg : "not found");
+        }
+        std::fprintf(stderr, "loader: %s\n", err_out ? err_out->c_str() : "");
+        return false;
+    }
+    *out = reinterpret_cast<void**>(sym);
+    return true;
+}
+
 }  // namespace
 
 bool Loader::open(const std::string& libs_dir) {
@@ -82,19 +102,14 @@ bool Loader::open(const std::string& libs_dir) {
                  mangled::resolv_set_nameservers_for_net,
                  &symbols_.resolv_set_nameservers_for_net, &last_error_)) return false;
 
-    // Vtable symbol (data object, not a function pointer).
-    {
-        dlerror();
-        void* v = dlsym(RTLD_DEFAULT, mangled::vtable_RequestContextConfig);
-        const char* msg = dlerror();
-        if (v == nullptr || msg != nullptr) {
-            last_error_ = std::string("dlsym(") + mangled::vtable_RequestContextConfig
-                          + "): " + (msg ? msg : "not found");
-            std::fprintf(stderr, "loader: %s\n", last_error_.c_str());
-            return false;
-        }
-        symbols_.vtable_RequestContextConfig = reinterpret_cast<void**>(v);
-    }
+    if (!resolve_vtable(mangled::vtable_RequestContextConfig,
+                        &symbols_.vtable_RequestContextConfig, &last_error_)) return false;
+    if (!resolve_vtable(mangled::vtable_CredentialsResponse,
+                        &symbols_.vtable_CredentialsResponse, &last_error_)) return false;
+    if (!resolve_vtable(mangled::vtable_ProtocolDialogResponse,
+                        &symbols_.vtable_ProtocolDialogResponse, &last_error_)) return false;
+    if (!resolve_vtable(mangled::vtable_HTTPMessage,
+                        &symbols_.vtable_HTTPMessage, &last_error_)) return false;
 
 #define RESOLVE(field, name) \
     if (!resolve(RTLD_DEFAULT, mangled::name, &symbols_.field, &last_error_)) return false
@@ -118,6 +133,58 @@ bool Loader::open(const std::string& libs_dir) {
     RESOLVE(RequestContextManager_configure,         RequestContextManager_configure);
     RESOLVE(RequestContext_init,                     RequestContext_init);
     RESOLVE(RequestContext_setFairPlayDirectoryPath, RequestContext_setFairPlayDirectoryPath);
+
+    // ---- Phase 1.1: AndroidPresentationInterface + auth flow ----
+    RESOLVE(make_shared_AndroidPresentationInterface, make_shared_AndroidPresentationInterface);
+    RESOLVE(API_setCredentialsHandler,                API_setCredentialsHandler);
+    RESOLVE(API_setDialogHandler,                     API_setDialogHandler);
+    RESOLVE(API_handleCredentialsResponse,            API_handleCredentialsResponse);
+    RESOLVE(API_handleProtocolDialogResponse,         API_handleProtocolDialogResponse);
+    RESOLVE(RequestContext_setPresentationInterface,  RequestContext_setPresentationInterface);
+
+    RESOLVE(ProtocolDialog_title,    ProtocolDialog_title);
+    RESOLVE(ProtocolDialog_message,  ProtocolDialog_message);
+    RESOLVE(ProtocolDialog_buttons,  ProtocolDialog_buttons);
+    RESOLVE(ProtocolButton_title,    ProtocolButton_title);
+    RESOLVE(ProtocolDialogResponse_ctor, ProtocolDialogResponse_ctor);
+    RESOLVE(ProtocolDialogResponse_setSelectedButton, ProtocolDialogResponse_setSelectedButton);
+
+    RESOLVE(CR_requiresHSA2VerificationCode, CR_requiresHSA2VerificationCode);
+    RESOLVE(CR_title,                        CR_title);
+    RESOLVE(CR_message,                      CR_message);
+
+    RESOLVE(CredentialsResponse_ctor,            CredentialsResponse_ctor);
+    RESOLVE(CredentialsResponse_setUserName,     CredentialsResponse_setUserName);
+    RESOLVE(CredentialsResponse_setPassword,     CredentialsResponse_setPassword);
+    RESOLVE(CredentialsResponse_setResponseType, CredentialsResponse_setResponseType);
+
+    RESOLVE(make_shared_AuthenticateFlow, make_shared_AuthenticateFlow);
+    RESOLVE(AuthenticateFlow_run,         AuthenticateFlow_run);
+    RESOLVE(AuthenticateFlow_response,    AuthenticateFlow_response);
+
+    RESOLVE(AR_responseType,    AR_responseType);
+    RESOLVE(AR_customerMessage, AR_customerMessage);
+    RESOLVE(AR_error,           AR_error);
+
+    RESOLVE(SEC_errorCode, SEC_errorCode);
+    RESOLVE(SEC_what,      SEC_what);
+
+    // ---- Phase 1.1: token harvest ----
+    RESOLVE(DeviceGUID_guid, DeviceGUID_guid);
+    RESOLVE(Data_bytes,      Data_bytes);
+
+    RESOLVE(HTTPMessage_ctor,        HTTPMessage_ctor);
+    RESOLVE(HTTPMessage_setHeader,   HTTPMessage_setHeader);
+    RESOLVE(HTTPMessage_setBodyData, HTTPMessage_setBodyData);
+
+    RESOLVE(URLRequest_ctor,              URLRequest_ctor);
+    RESOLVE(URLRequest_setRequestParameter, URLRequest_setRequestParameter);
+    RESOLVE(URLRequest_run,               URLRequest_run);
+    RESOLVE(URLRequest_error,             URLRequest_error);
+    RESOLVE(URLRequest_response,          URLRequest_response);
+    RESOLVE(URLResponse_underlyingResponse, URLResponse_underlyingResponse);
+
+    RESOLVE(RequestContext_storeFrontIdentifier, RequestContext_storeFrontIdentifier);
 
 #undef RESOLVE
 

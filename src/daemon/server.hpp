@@ -18,10 +18,10 @@ namespace wrapper {
 
 struct ServerInfo {
     // Free-form version string surfaced via /health and /me.
-    std::string version = "0.1.0-phase1";
+    std::string version = "0.1.0-phase1.1";
 
     // True iff Apple lib initialization is enabled (controlled by
-    // WRAPPER_APPLE_INIT). Surfaced via /me to make it obvious when
+    // WRAPPER_APPLE_INIT). Surfaced via /health so it is obvious when
     // the daemon is running in stub-only mode.
     bool apple_init_enabled = true;
 };
@@ -31,7 +31,7 @@ public:
     Server(httplib::Server& svr,
            apple::Runtime& rt,
            apple::Loader& loader,
-           apple::AuthState& auth,
+           apple::Account& account,
            ServerInfo info);
 
     // Mount all routes onto the underlying httplib::Server.
@@ -41,7 +41,7 @@ private:
     httplib::Server& svr_;
     apple::Runtime& rt_;
     apple::Loader& loader_;
-    apple::AuthState& auth_;
+    apple::Account& account_;
     ServerInfo info_;
 };
 

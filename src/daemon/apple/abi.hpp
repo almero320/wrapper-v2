@@ -16,10 +16,13 @@
 // the APK is changed, re-derive with `nm -D --defined libstoreservicescore.so`
 // and update LIBS_VERSION.json.
 //
-// Phase 1.0 only declares the symbols we need to bring the runtime up
-// (DNS, DeviceGUID, RequestContext, FootHillConfig). Auth, m3u8, and
-// decrypt symbols will land in subsequent commits as they are wired
-// up.
+// Phase 1.0 brought runtime init online (DNS, DeviceGUID, RequestContext,
+// FootHillConfig). Phase 1.1 adds:
+//   - AuthenticateFlow + CredentialsResponse + AndroidPresentationInterface
+//     (real Apple-ID/password login)
+//   - URLRequest + URLResponse + HTTPMessage + Data
+//     (signed HTTPS for dev-token and music-user-token harvest)
+//   - StoreErrorCondition (error reporting)
 
 #pragma once
 
@@ -130,6 +133,188 @@ using fn_RequestContextManager_configure = void (*)(shared_ptr* req_ctx);
 using fn_RequestContext_init =
     void (*)(void* hidden_return, void* this_, shared_ptr* config);
 
+// ---------------------------------------------------------------------------
+// Phase 1.1 - AndroidPresentationInterface + callbacks
+// ---------------------------------------------------------------------------
+//
+// AuthenticateFlow uses a "presentation interface" object to ask the
+// host program for credentials and to surface UI dialogs. We satisfy
+// it with the Android-flavored implementation Apple ships
+// (`AndroidPresentationInterface`), and we register two handlers whose
+// signatures match Apple's C++ `std::shared_ptr` callback types. The
+// dialog handler logs each ProtocolDialog and must call
+// handleProtocolDialogResponse or login stalls.
+
+// std::shared_ptr<AndroidPresentationInterface>::make_shared<>()
+using fn_make_shared_AndroidPresentationInterface = void (*)(shared_ptr* out);
+
+// Apple's setCredentialsHandler / setDialogHandler store a function pointer
+// whose C++ type passes std::shared_ptr by value. On x86_64 Itanium ABI,
+// std::shared_ptr has a non-trivial copy ctor/dtor so it is passed *indirectly*
+// (the caller puts a pointer to a temporary in %rdi/%rsi). Declaring the
+// callback with explicit shared_ptr* parameters matches that exactly — which
+// is also what the upstream C wrapper does (struct shared_ptr *).
+using fn_credential_handler = void (*)(shared_ptr* cred_request,
+                                       shared_ptr* cred_response_handler);
+
+using fn_dialog_handler = void (*)(long dialog_id,
+                                   shared_ptr* dialog,
+                                   shared_ptr* response_handler);
+
+// AndroidPresentationInterface::setCredentialsHandler(fn_credential_handler)
+using fn_API_setCredentialsHandler =
+    void (*)(void* this_, fn_credential_handler cb);
+
+// AndroidPresentationInterface::setDialogHandler(fn_dialog_handler)
+using fn_API_setDialogHandler =
+    void (*)(void* this_, fn_dialog_handler cb);
+
+// AndroidPresentationInterface::handleCredentialsResponse(
+//     shared_ptr<CredentialsResponse> const&)
+using fn_API_handleCredentialsResponse =
+    void (*)(void* this_, shared_ptr* cred_response);
+
+// AndroidPresentationInterface::handleProtocolDialogResponse(
+//     long const&, shared_ptr<ProtocolDialogResponse> const&)
+using fn_API_handleProtocolDialogResponse =
+    void (*)(void* this_, const long* dialog_id, const shared_ptr* dialog_response);
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 - ProtocolDialog / ProtocolDialogResponse (login UI)
+// ---------------------------------------------------------------------------
+
+using fn_ProtocolDialog_title    = std_string* (*)(void* this_);
+using fn_ProtocolDialog_message  = std_string* (*)(void* this_);
+using fn_ProtocolDialog_buttons  = std_vector* (*)(void* this_);
+using fn_ProtocolButton_title    = std_string* (*)(void* this_);
+using fn_ProtocolDialogResponse_ctor = void (*)(void* this_);
+using fn_ProtocolDialogResponse_setSelectedButton =
+    void (*)(void* this_, const shared_ptr* button);
+
+// storeservicescore::RequestContext::setPresentationInterface(
+//     shared_ptr<PresentationInterface> const&)
+using fn_RequestContext_setPresentationInterface =
+    void (*)(void* this_, shared_ptr* presentation_interface);
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 - CredentialsRequest / CredentialsResponse
+// ---------------------------------------------------------------------------
+//
+// CredentialsRequest is what gets passed *to* the credential handler
+// (read-only metadata about why credentials are being asked for).
+// CredentialsResponse is what we construct and return.
+
+// CredentialsRequest::requiresHSA2VerificationCode() const
+using fn_CR_requiresHSA2VerificationCode = std::uint8_t (*)(void* this_);
+
+// CredentialsRequest::title() const / message() const - return a
+// pointer to a std::string we may read but must not free.
+using fn_CR_title   = std_string* (*)(void* this_);
+using fn_CR_message = std_string* (*)(void* this_);
+
+// CredentialsResponse::CredentialsResponse() - default constructor.
+using fn_CredentialsResponse_ctor = void (*)(void* this_);
+
+// CredentialsResponse::setUserName / setPassword (std::string const&)
+using fn_CredentialsResponse_set_string = void (*)(void* this_, std_string* s);
+
+// CredentialsResponse::setResponseType(ResponseType) - upstream passes
+// `2` after setting username+password to signal "submit credentials".
+using fn_CredentialsResponse_setResponseType = void (*)(void* this_, int response_type);
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 - AuthenticateFlow / AuthenticateResponse
+// ---------------------------------------------------------------------------
+
+// std::shared_ptr<AuthenticateFlow>::make_shared<RequestContext&>(RequestContext&)
+using fn_make_shared_AuthenticateFlow =
+    void (*)(shared_ptr* out, shared_ptr* req_ctx);
+
+// AuthenticateFlow::run() - synchronous; fires credentialHandler internally.
+using fn_AuthenticateFlow_run = void (*)(void* this_);
+
+// AuthenticateFlow::response() const - returns a shared_ptr<AuthenticateResponse>
+// owned by the flow.
+using fn_AuthenticateFlow_response = shared_ptr* (*)(void* this_);
+
+// AuthenticateResponse::responseType() const - 6 means success;
+// other values indicate failure or cancellation.
+using fn_AR_responseType = int (*)(void* this_);
+
+// AuthenticateResponse::customerMessage() const - returns pointer to
+// a std::string (might be empty).
+using fn_AR_customerMessage = std_string* (*)(void* this_);
+
+// AuthenticateResponse::error() const - returns a shared_ptr<StoreErrorCondition>;
+// null if no error.
+using fn_AR_error = shared_ptr* (*)(void* this_);
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 - StoreErrorCondition
+// ---------------------------------------------------------------------------
+
+using fn_SEC_errorCode = int (*)(void* this_);
+using fn_SEC_what      = const char* (*)(void* this_);
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 - DeviceGUID accessor + mediaplatform::Data
+// ---------------------------------------------------------------------------
+
+// DeviceGUID::guid() - returns a (Data, ...) tuple via a hidden 16-byte
+// out param. The first 8 bytes are a pointer to mediaplatform::Data
+// whose bytes() yields the GUID string.
+using fn_DeviceGUID_guid = void (*)(void* hidden_return /* [2]void* */,
+                                    void* this_);
+
+// mediaplatform::Data::bytes() const -> char* (NUL-terminated for the
+// strings Apple's HTTP layer returns).
+using fn_Data_bytes = const char* (*)(void* this_);
+
+// ---------------------------------------------------------------------------
+// Phase 1.1 - URLRequest / URLResponse / HTTPMessage
+// ---------------------------------------------------------------------------
+//
+// To call out to Apple's iTunes endpoints (apiToken, createMusicToken)
+// we construct an HTTPMessage, wrap it in a URLRequest which is bound
+// to our RequestContext (so it gets signed with DSID + X-Token), call
+// run(), then unwrap URLResponse -> underlyingResponse -> raw bytes.
+
+// HTTPMessage::HTTPMessage(string url, string method)
+using fn_HTTPMessage_ctor =
+    void (*)(void* this_, std_string* url, std_string* method);
+
+// HTTPMessage::setHeader(string name, string value)
+using fn_HTTPMessage_setHeader =
+    void (*)(void* this_, std_string* name, std_string* value);
+
+// HTTPMessage::setBodyData(char* body, size_t len)
+using fn_HTTPMessage_setBodyData =
+    void (*)(void* this_, const char* body, std::size_t len);
+
+// URLRequest::URLRequest(shared_ptr<HTTPMessage> const&,
+//                       shared_ptr<RequestContext> const&)
+using fn_URLRequest_ctor =
+    void (*)(void* this_, shared_ptr* http_message, shared_ptr* req_ctx);
+
+// URLRequest::setRequestParameter(std::string name, std::string value)
+// - the two-string overload (a vector<string> overload also exists).
+using fn_URLRequest_setRequestParameter =
+    void (*)(void* this_, std_string* name, std_string* value);
+
+using fn_URLRequest_run      = void (*)(void* this_);
+using fn_URLRequest_error    = shared_ptr* (*)(void* this_);
+using fn_URLRequest_response = shared_ptr* (*)(void* this_);
+
+// URLResponse::underlyingResponse() const - returns the inner
+// HTTPMessage shared_ptr whose body bytes we read out at offset +48.
+using fn_URLResponse_underlyingResponse = shared_ptr* (*)(void* this_);
+
+// RequestContext::storeFrontIdentifier(shared_ptr<URLBag> const&) const
+// - writes a std::string to the hidden first arg; the URLBag arg is
+// passed as a null shared_ptr (upstream pattern).
+using fn_RequestContext_storeFrontIdentifier =
+    void (*)(std_string* out, void* this_, shared_ptr* url_bag);
+
 // Mangled symbol names. These are the *strings* we feed to dlsym.
 // Kept centrally so that the Loader implementation does not embed
 // them inline (easier to audit and regenerate from `nm` output).
@@ -181,6 +366,109 @@ inline constexpr const char* RequestContext_init =
     "_ZN17storeservicescore14RequestContext4initERKNSt6__ndk110shared_ptrINS_20RequestContextConfigEEE";
 inline constexpr const char* RequestContext_setFairPlayDirectoryPath =
     "_ZN17storeservicescore14RequestContext24setFairPlayDirectoryPathERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE";
+
+// ---- Phase 1.1: AndroidPresentationInterface + auth flow ----
+
+inline constexpr const char* make_shared_AndroidPresentationInterface =
+    "_ZNSt6__ndk110shared_ptrIN20androidstoreservices28AndroidPresentationInterfaceEE11make_sharedIJEEES3_DpOT_";
+
+inline constexpr const char* API_setCredentialsHandler =
+    "_ZN20androidstoreservices28AndroidPresentationInterface21setCredentialsHandlerEPFvNSt6__ndk110shared_ptrIN17storeservicescore18CredentialsRequestEEENS2_INS_33AndroidCredentialsResponseHandlerEEEE";
+
+inline constexpr const char* API_setDialogHandler =
+    "_ZN20androidstoreservices28AndroidPresentationInterface16setDialogHandlerEPFvlNSt6__ndk110shared_ptrIN17storeservicescore14ProtocolDialogEEENS2_INS_36AndroidProtocolDialogResponseHandlerEEEE";
+
+inline constexpr const char* API_handleCredentialsResponse =
+    "_ZN20androidstoreservices28AndroidPresentationInterface25handleCredentialsResponseERKNSt6__ndk110shared_ptrIN17storeservicescore19CredentialsResponseEEE";
+inline constexpr const char* API_handleProtocolDialogResponse =
+    "_ZN20androidstoreservices28AndroidPresentationInterface28handleProtocolDialogResponseERKlRKNSt6__ndk110shared_ptrIN17storeservicescore22ProtocolDialogResponseEEE";
+
+inline constexpr const char* vtable_ProtocolDialogResponse =
+    "_ZTVNSt6__ndk120__shared_ptr_emplaceIN17storeservicescore22ProtocolDialogResponseENS_9allocatorIS2_EEEE";
+inline constexpr const char* ProtocolDialogResponse_ctor =
+    "_ZN17storeservicescore22ProtocolDialogResponseC1Ev";
+inline constexpr const char* ProtocolDialogResponse_setSelectedButton =
+    "_ZN17storeservicescore22ProtocolDialogResponse17setSelectedButtonERKNSt6__ndk110shared_ptrINS_14ProtocolButtonEEE";
+inline constexpr const char* ProtocolDialog_title =
+    "_ZNK17storeservicescore14ProtocolDialog5titleEv";
+inline constexpr const char* ProtocolDialog_message =
+    "_ZNK17storeservicescore14ProtocolDialog7messageEv";
+inline constexpr const char* ProtocolDialog_buttons =
+    "_ZNK17storeservicescore14ProtocolDialog7buttonsEv";
+inline constexpr const char* ProtocolButton_title =
+    "_ZNK17storeservicescore14ProtocolButton5titleEv";
+
+inline constexpr const char* RequestContext_setPresentationInterface =
+    "_ZN17storeservicescore14RequestContext24setPresentationInterfaceERKNSt6__ndk110shared_ptrINS_21PresentationInterfaceEEE";
+
+inline constexpr const char* CR_requiresHSA2VerificationCode =
+    "_ZNK17storeservicescore18CredentialsRequest28requiresHSA2VerificationCodeEv";
+inline constexpr const char* CR_title =
+    "_ZNK17storeservicescore18CredentialsRequest5titleEv";
+inline constexpr const char* CR_message =
+    "_ZNK17storeservicescore18CredentialsRequest7messageEv";
+
+inline constexpr const char* vtable_CredentialsResponse =
+    "_ZTVNSt6__ndk120__shared_ptr_emplaceIN17storeservicescore19CredentialsResponseENS_9allocatorIS2_EEEE";
+inline constexpr const char* CredentialsResponse_ctor =
+    "_ZN17storeservicescore19CredentialsResponseC1Ev";
+inline constexpr const char* CredentialsResponse_setUserName =
+    "_ZN17storeservicescore19CredentialsResponse11setUserNameERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE";
+inline constexpr const char* CredentialsResponse_setPassword =
+    "_ZN17storeservicescore19CredentialsResponse11setPasswordERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE";
+inline constexpr const char* CredentialsResponse_setResponseType =
+    "_ZN17storeservicescore19CredentialsResponse15setResponseTypeENS0_12ResponseTypeE";
+
+inline constexpr const char* make_shared_AuthenticateFlow =
+    "_ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_";
+inline constexpr const char* AuthenticateFlow_run =
+    "_ZN17storeservicescore16AuthenticateFlow3runEv";
+inline constexpr const char* AuthenticateFlow_response =
+    "_ZNK17storeservicescore16AuthenticateFlow8responseEv";
+
+inline constexpr const char* AR_responseType =
+    "_ZNK17storeservicescore20AuthenticateResponse12responseTypeEv";
+inline constexpr const char* AR_customerMessage =
+    "_ZNK17storeservicescore20AuthenticateResponse15customerMessageEv";
+inline constexpr const char* AR_error =
+    "_ZNK17storeservicescore20AuthenticateResponse5errorEv";
+
+inline constexpr const char* SEC_errorCode =
+    "_ZNK17storeservicescore19StoreErrorCondition9errorCodeEv";
+inline constexpr const char* SEC_what =
+    "_ZNK17storeservicescore19StoreErrorCondition4whatEv";
+
+// ---- Phase 1.1: token harvest ----
+
+inline constexpr const char* DeviceGUID_guid =
+    "_ZN17storeservicescore10DeviceGUID4guidEv";
+inline constexpr const char* Data_bytes =
+    "_ZNK13mediaplatform4Data5bytesEv";
+
+inline constexpr const char* vtable_HTTPMessage =
+    "_ZTVNSt6__ndk120__shared_ptr_emplaceIN13mediaplatform11HTTPMessageENS_9allocatorIS2_EEEE";
+inline constexpr const char* HTTPMessage_ctor =
+    "_ZN13mediaplatform11HTTPMessageC2ENSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_";
+inline constexpr const char* HTTPMessage_setHeader =
+    "_ZN13mediaplatform11HTTPMessage9setHeaderERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_";
+inline constexpr const char* HTTPMessage_setBodyData =
+    "_ZN13mediaplatform11HTTPMessage11setBodyDataEPcm";
+
+inline constexpr const char* URLRequest_ctor =
+    "_ZN17storeservicescore10URLRequestC2ERKNSt6__ndk110shared_ptrIN13mediaplatform11HTTPMessageEEERKNS2_INS_14RequestContextEEE";
+inline constexpr const char* URLRequest_setRequestParameter =
+    "_ZN17storeservicescore10URLRequest19setRequestParameterERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_";
+inline constexpr const char* URLRequest_run =
+    "_ZN17storeservicescore10URLRequest3runEv";
+inline constexpr const char* URLRequest_error =
+    "_ZNK17storeservicescore10URLRequest5errorEv";
+inline constexpr const char* URLRequest_response =
+    "_ZNK17storeservicescore10URLRequest8responseEv";
+inline constexpr const char* URLResponse_underlyingResponse =
+    "_ZNK17storeservicescore11URLResponse18underlyingResponseEv";
+
+inline constexpr const char* RequestContext_storeFrontIdentifier =
+    "_ZNK17storeservicescore14RequestContext20storeFrontIdentifierERKNSt6__ndk110shared_ptrINS_6URLBagEEE";
 
 }  // namespace mangled
 
