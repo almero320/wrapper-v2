@@ -1,6 +1,7 @@
 # wrapper-v2
 
-A clean rewrite of the Apple Music FairPlay decryption wrapper.
+A clean rewrite of the Apple Music FairPlay decryption wrapper, based on
+[`WorldObservationLog/wrapper`](https://github.com/WorldObservationLog/wrapper).
 
 Current version: **0.0.1**.
 
