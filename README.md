@@ -3,8 +3,6 @@
 A clean rewrite of the Apple Music FairPlay decryption wrapper, based on
 [`WorldObservationLog/wrapper`](https://github.com/WorldObservationLog/wrapper).
 
-Current version: **0.0.1**.
-
 ## Development note
 
 This project has been developed with heavy AI assistance. The code should be
