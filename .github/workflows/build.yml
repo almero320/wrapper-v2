@@ -51,26 +51,30 @@ jobs:
             jq unzip curl ca-certificates
 
       - name: Make scripts executable
-        run: chmod +x tools/fetch-apk.sh tools/extract-libs.sh tools/stage-system.sh
+        run: chmod +x tools/extract-libs.sh tools/stage-system.sh
 
       - name: Sanity check APK_URL secret
         run: |
           if [[ -z "${APK_URL}" ]]; then
             echo "::error::APK_URL secret is not set."
-            echo "Maintainers: set APK_URL to a URL for the pinned .apkm (hash in LIBS_VERSION.json → apkm)."
+            echo "Maintainers: set APK_URL to a private/local CI URL for a compatible .apk or .apkm."
             exit 1
           fi
 
-      - name: Download and verify .apkm
+      - name: Download Apple Music artifact
         run: |
-          ./tools/fetch-apk.sh \
-            --url "${APK_URL}" \
-            --expect apkm
+          mkdir -p .tmp
+          artifact=".tmp/apple-music.apk"
+          if [[ "${APK_URL,,}" == *.apkm* ]]; then
+            artifact=".tmp/apple-music.apkm"
+          fi
+          curl -fL --retry 3 --retry-delay 2 -o "${artifact}" "${APK_URL}"
+          echo "APPLE_MUSIC_ARTIFACT=${artifact}" >> "$GITHUB_ENV"
 
       - name: Extract Apple native libs
         run: |
           ./tools/extract-libs.sh \
-            --bundle .tmp/bundle.apkm \
+            --bundle "${APPLE_MUSIC_ARTIFACT}" \
             --arch ${{ matrix.arch }}
 
       - name: Stage Android system binaries
