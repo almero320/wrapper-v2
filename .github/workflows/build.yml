@@ -34,7 +34,7 @@ jobs:
             docker_platform: linux/arm64
 
     env:
-      APK_URL: ${{ https://www.apkmirror.com/wp-content/themes/APKMirror/download.php?id=2351975&key=88231a3526274340f9e808dffbc0baacdd747bd4 }}
+      APK_URL: ${{ https://tmpfiles.org/dl/wKwr6FAE8xtK/com.apple.android.music_3.6.0-beta-1109_2arch_2dpi_d17c9d486201413b9aa9a1d62bc7b1d3_apkmirror.com.apkm }}
 
     steps:
       - uses: actions/checkout@v4
